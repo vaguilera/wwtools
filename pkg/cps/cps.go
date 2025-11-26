@@ -50,7 +50,7 @@ type CPSImage struct {
 	Image       *image.RGBA
 }
 
-func GreyPalette() []byte {
+func grayPalette() []byte {
 	p := make([]byte, 256*3)
 	for i := range p {
 		p[i] = byte(i / 3)
@@ -61,7 +61,6 @@ func GreyPalette() []byte {
 func expandPalette(src []byte) []byte {
 	dst := make([]byte, len(src))
 	for i := 0; i < len(src); i++ {
-		// src[i] en [0..63], lo subimos a [0..255]
 		v := int(src[i]) * 255 / 63
 		dst[i] = byte(v)
 	}
@@ -75,23 +74,22 @@ func LoadCPS(data []byte, palette []byte) (*CPSImage, error) {
 	if err != nil {
 		return nil, err
 	}
+	width := 320
+	height := 200
 
 	var imgRaw []byte
 	switch header.CompressionType {
 	case COMPRESSION_WESTWOOD_LCW:
-		imgRaw = decompressLCW(data[10:])
+		imgRaw = decompressLCW(data[10:], width*height)
 	case COMPRESSION_WESTWOOD_RLE:
-		imgRaw = decompressRLE(data[10:])
+		imgRaw = decompressRLE(data[10:], width*height)
 	default:
 		return nil, fmt.Errorf("unsupported compression method")
 	}
 
-	width := 320
-	height := 200
-
 	var palRaw []byte
 	if palette == nil {
-		palRaw = GreyPalette()
+		palRaw = grayPalette()
 	} else {
 		palRaw = expandPalette(palette)
 	}
@@ -136,108 +134,106 @@ func (cps *CPSImage) SavePNG(filename string) error {
 	return nil
 }
 
-func decompressLCW(data []byte) []byte {
-	dest := make([]byte, 64000)
+func decompressLCW(data []byte, imgSize int) []byte {
+	dest := make([]byte, imgSize)
+	dp := 0
+	sp := 0
 
-	dp := uint16(0)
-	sp := uint16(0)
 	relative := false
-	if data[0] == 0 {
+	if len(data) > 0 && data[0] == 0 {
 		relative = true
 		sp++
 	}
-	for {
-		if dp >= 64000 {
-			return dest
-		}
+
+	for dp < imgSize && sp < len(data) {
 		com := data[sp]
 		sp++
 
 		if (com & 0x80) == 0 { // bit 7
 			// command 2 Existing block relative copy
-			count := uint16((com >> 4) + 3)
-			if count > 64000-dp {
-				count = 64000 - dp
-			}
-			pos := ((uint16(com & 0x0F)) << 8) + uint16(data[sp])
+			count := int(com>>4) + 3
+			pos := (int(com&0x0F) << 8) + int(data[sp])
 			sp++
-			for i := uint16(0); i < count; i++ {
+			for i := 0; i < count && dp < imgSize; i++ {
 				dest[dp] = dest[dp-pos]
 				dp++
 			}
-		} else {
-			if (com & 0x40) == 0 { // Command 1 - short copy
-				count := com & 0x3F
-				if count == 0 {
-					return dest
-				}
-				for i := byte(0); i < count; i++ {
-					dest[dp] = data[sp]
-					sp++
-					dp++
-				}
-			} else {
-				count := com & 0x3F
-				if count < 0x3E { // {large copy (3)}
-					count += 3
-					// {Next word = pos. from start of image}
-					posit := uint16(0)
-					dat := (uint16(data[sp+1]) << 8) + uint16(data[sp])
-					sp += 2
-					if relative { // { relative }
-						posit = dp - dat
-					} else {
-						posit = dat
-					}
-					for i := posit; i < posit+uint16(count); i++ {
-						if dp >= 64000 || i >= 64000 {
-							return dest
-						}
-						dest[dp] = dest[i]
-						dp++
-					}
+			continue
+		}
 
-				} else if count == 0x3F { //{very large copy (5)}
-					count := (uint16(data[sp+1]) << 8) + uint16(data[sp]) // {next 2 words are Count and Pos}
-					sp += 2
-					posit := uint16(0)
-					dat := (uint16(data[sp+1]) << 8) + uint16(data[sp])
-					sp += 2
-					if relative {
-						posit = dp - dat
-					} else {
-						posit = dat
-					}
-					for i := posit; i < posit+count; i++ {
-						dest[dp] = dest[i]
-						dp++
-					}
-				} else {
-					// Oush. It was littleEndian
-					count := (uint16(data[sp+1]) << 8) + uint16(data[sp]) // command 4
-					sp += 2
-					b := data[sp]
-					sp++
-					for i := uint16(0); i < count; i++ {
-						dest[dp] = b
-						dp++
-					}
+		if (com & 0x40) == 0 { // Command 1 - short copy
+			count := int(com & 0x3F)
+			if count == 0 {
+				break
+			}
+			if sp+count > len(data) {
+				count = len(data) - sp
+			}
+			if dp+count > imgSize {
+				count = imgSize - dp
+			}
+			copy(dest[dp:dp+count], data[sp:sp+count])
+			sp += count
+			dp += count
+			continue
+		}
+
+		count := int(com & 0x3F)
+		switch {
+		case count < 0x3E: // {large copy (3)}
+			count += 3
+			// {Next word = pos. from start of image}
+			dat := (int(data[sp+1]) << 8) + int(data[sp])
+			sp += 2
+			var posit int
+			if relative { // { relative }
+				posit = dp - dat
+			} else {
+				posit = dat
+			}
+			for i := posit; i < posit+count && dp < imgSize; i++ {
+				if i >= imgSize {
+					break
 				}
+				dest[dp] = dest[i]
+				dp++
+			}
+
+		case count == 0x3F: //{very large copy (5)}
+			count := (int(data[sp+1]) << 8) + int(data[sp]) // {next 2 words are Count and Pos}
+			sp += 2
+			dat := (int(data[sp+1]) << 8) + int(data[sp])
+			sp += 2
+			var posit int
+			if relative {
+				posit = dp - dat
+			} else {
+				posit = dat
+			}
+			for i := posit; i < posit+count; i++ {
+				dest[dp] = dest[i]
+				dp++
+			}
+		default:
+			count := (int(data[sp+1]) << 8) + int(data[sp]) // command 4
+			sp += 2
+			b := data[sp]
+			sp++
+			for i := 0; i < count; i++ {
+				dest[dp] = b
+				dp++
 			}
 		}
 	}
+	return dest
 }
 
-func decompressRLE(data []byte) []byte {
-	dest := make([]byte, 64000)
-
+func decompressRLE(data []byte, imgSize int) []byte {
+	dest := make([]byte, imgSize)
 	dp := 0
 	sp := 0
 
-	for {
-		if dp >= 64000 {
-			return dest
-		}
+	for dp < imgSize && sp < len(data) {
 		b := int(int8(data[sp]))
 		sp++
 
@@ -265,4 +261,5 @@ func decompressRLE(data []byte) []byte {
 			}
 		}
 	}
+	return dest
 }
